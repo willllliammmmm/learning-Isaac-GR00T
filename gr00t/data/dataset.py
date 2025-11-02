@@ -105,7 +105,13 @@ class ModalityConfig(BaseModel):
 
 class LeRobotSingleDataset(Dataset):
     """
-    Base dataset class for LeRobot that supports sharding.
+    LeRobot 数据集基类 —— 支持 sharding（数据分片加载）。
+
+    用途：
+        这是 GR00T 数据管线中最底层的数据集抽象。
+        负责加载一个符合 LeRobot 格式的数据集（单任务或单机体），
+        读取视频帧、动作标签和统计信息，并根据配置执行模态变换。
+
     """
 
     def __init__(
@@ -118,21 +124,43 @@ class LeRobotSingleDataset(Dataset):
         transforms: ComposedModalityTransform | None = None,
     ):
         """
-        Initialize the dataset.
+        初始化数据集对象。
 
-        Args:
-            dataset_path (Path | str): The path to the dataset.
-            modality_configs (dict[str, ModalityConfig]): The configuration for each modality. The keys are the modality names, and the values are the modality configurations.
-                See `ModalityConfig` for more details.
-            video_backend (str): Backend for video reading.
-            video_backend_kwargs (dict): Keyword arguments for the video backend when initializing the video reader.
-            transforms (ComposedModalityTransform): The transforms to apply to the dataset.
-            embodiment_tag (EmbodimentTag): Overload the embodiment tag for the dataset. e.g. define it as "new_embodiment"
+        参数说明：
+            dataset_path (Path | str):
+                数据集所在路径（可以是本地路径或远程挂载）。
+                LeRobot 格式通常包含 observations/、actions/、metadata.json 等。
+
+            modality_configs (dict[str, ModalityConfig]):
+                各模态（modality）的配置字典。
+                键是模态名（如 "rgb_front"、"proprioception"、"language"），
+                值是每个模态的配置对象 ModalityConfig，
+                定义了模态类型、读取方式、预处理规则等。
+
+            embodiment_tag (EmbodimentTag 或 str):
+                机器人“机体标识”，例如 "humanoid"、"franka"、"allegro_hand"。
+                表示数据集来自哪种机器人结构（影响动作维度、状态维度等）。
+
+            video_backend (str):
+                视频读取后端，默认使用 "torchcodec"。
+                可选项通常包括：
+                    - "torchcodec"（基于 PyTorch 的 GPU 加速解码）
+                    - "decord"（轻量快速）
+                    - "opencv"（兼容性好）
+
+            video_backend_kwargs (dict):
+                视频后端初始化时的附加参数（例如解码线程数、缓存大小等）。
+
+            transforms (ComposedModalityTransform):
+                数据集级别的模态变换管线（图像 resize、归一化、文本 tokenize 等）。
+                如果未提供，则默认创建一个空的 ComposedModalityTransform。
         """
-        # first check if the path directory exists
+
+        # 🧩 Step 1. 检查数据集路径是否存在
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
 
+        # 🧩 Step 2. 保存输入配置
         self.modality_configs = modality_configs
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs if video_backend_kwargs is not None else {}
@@ -140,48 +168,80 @@ class LeRobotSingleDataset(Dataset):
             transforms if transforms is not None else ComposedModalityTransform(transforms=[])
         )
 
+        # 🧩 Step 3. 基本元信息（数据集路径、名称）
         self._dataset_path = Path(dataset_path)
         self._dataset_name = self._dataset_path.name
+
+        # 🧩 Step 4. 处理机体标签（EmbodimentTag）
+        #   如果传入的是枚举类型 EmbodimentTag，则取其 value；
+        #   否则直接使用字符串。
         if isinstance(embodiment_tag, EmbodimentTag):
             self.tag = embodiment_tag.value
         else:
             self.tag = embodiment_tag
 
+        # 🧩 Step 5. 读取数据集的元数据（如模态结构、动作范围、统计信息）
         self._metadata = self._get_metadata(EmbodimentTag(self.tag))
+
+        # 🧩 Step 6. 获取轨迹信息（trajectory）
+        #   _get_trajectories() 通常返回：
+        #   - 所有轨迹 ID（视频或演示编号）
+        #   - 每条轨迹的长度（步数）
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
+
+        # 🧩 Step 7. 收集所有 step 索引（全局索引）
         self._all_steps = self._get_all_steps()
+
+        # 🧩 Step 8. 模态键（例如 {"observation": [...], "action": [...]}）
         self._modality_keys = self._get_modality_keys()
+
+        # 🧩 Step 9. 时间差索引（delta indices）
+        #   用于构建时间间隔样本（如 t, t+Δt）
         self._delta_indices = self._get_delta_indices()
         self._max_delta_index = self._get_max_delta_index()
 
-        # NOTE(YL): method to predict the task progress
+        # 🧠 Step 10. 特殊处理：检测 “任务进度（task_progress）” 字段
+        #   有些数据集会在 action 模态中额外提供一个 "task_progress"，
+        #   表示任务执行的进度百分比（0.0~1.0）。
         if "action.task_progress" in self._modality_keys["action"]:
             print("action.task_progress is in the action modality, task progress will be label")
+
+            # 在 action 模态的 key 列表中添加该字段
             self._modality_keys["action"].append("action.task_progress")
+
+            # 在 metadata 中注册该新字段
             self._metadata.modalities.action["task_progress"] = StateActionMetadata(
                 absolute=True, rotation_type=None, shape=(1,), continuous=True
             )
-            # assume the task progress is uniformly distributed between 0 and 1
+
+            # 人工定义该字段的统计值（均匀分布在 0~1）
             self._metadata.statistics.action["task_progress"] = DatasetStatisticalValues(
                 max=[1.0], min=[0.0], mean=[0.5], std=[0.2887], q01=[0.01], q99=[0.99]
             )
 
+        # 🧩 Step 11. 将 metadata 绑定到 transform（方便标准化或归一化）
         self.set_transforms_metadata(self.metadata)
+
+        # 🧩 Step 12. 初始化 epoch（为分布式/多进程加载器准备）
         self.set_epoch(0)
 
         print(f"Initialized dataset {self.dataset_name} with {embodiment_tag}")
 
-        # LeRobot-specific config
+        # 🧩 Step 13. LeRobot 专属配置与缓存
+        #   以下方法用于确定数据存储路径、视频命名模式、chunk 大小等：
         self._lerobot_modality_meta = self._get_lerobot_modality_meta()
         self._lerobot_info_meta = self._get_lerobot_info_meta()
         self._data_path_pattern = self._get_data_path_pattern()
         self._video_path_pattern = self._get_video_path_pattern()
         self._chunk_size = self._get_chunk_size()
         self._tasks = self._get_tasks()
+
+        # 当前缓存的轨迹数据（lazy load）
         self.curr_traj_data = None
         self.curr_traj_id = None
 
-        # Check if the dataset is valid
+        # 🧩 Step 14. 最终完整性检查
+        #   检查文件夹结构、模态一致性、索引范围等是否匹配
         self._check_integrity()
 
     @property
